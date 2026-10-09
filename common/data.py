@@ -112,11 +112,17 @@ def encode_prompt_response(
     from the right rather than removing prompt/question tokens.
     """
 
-    prompt_ids = tokenizer.apply_chat_template(
+    prompt_res = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
     )
+    if isinstance(prompt_res, dict) or hasattr(prompt_res, "input_ids"):
+        prompt_ids = list(prompt_res["input_ids"])
+    elif hasattr(prompt_res, "tolist"):
+        prompt_ids = prompt_res.tolist()
+    else:
+        prompt_ids = list(prompt_res)
 
     # A DPO example is meaningful only if we can condition on the prompt.
     if len(prompt_ids) >= max_length:
@@ -153,7 +159,7 @@ def encode_prompt_response(
     assert len(ids) <= max_length
     assert len(ids) == len(response_mask)
 
-    return ids, response_mask
+    return ids, response_maskk
 
 
 def pad_batch(tokenizer, examples: list[tuple[list[int], list[int]]]):

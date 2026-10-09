@@ -203,10 +203,16 @@ def evaluate_dpo(
     cfg = load_yaml(config_path)
     eval_rows = read_jsonl(eval_dataset or cfg["paths"]["dpo_standard_eval"])
     tokenizer = load_tokenizer(cfg["base_model"])
+    def get_token_count(msgs):
+        out = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
+        if isinstance(out, dict) or hasattr(out, "input_ids"):
+            return len(out["input_ids"])
+        return len(out)
+
     max_len = int(cfg["max_sequence_length"])
     eval_rows = [
         r for r in eval_rows
-        if len(tokenizer.apply_chat_template(prompt_messages_from_preference(r), tokenize=True, add_generation_prompt=True)) < max_len
+        if get_token_count(prompt_messages_from_preference(r)) < max_len
     ]
     policy = load_policy(cfg, adapter_path=adapter_path, trainable=False)
     reward_model, reward_tok = load_reward_model(cfg)
