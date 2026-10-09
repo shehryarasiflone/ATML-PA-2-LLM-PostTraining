@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.nn.functional as F
+import torch.nn.functional as F
 
 from common.data import (
     encode_prompt_response,
