@@ -216,6 +216,7 @@ def evaluate_dpo(
     eval_dataset: str | None = None,
     run_name: str = "standard",
     output_dir: str | None = None,
+    beta: float | None = None,
 ) -> dict:
     cfg = load_yaml(config_path)
     eval_rows = read_jsonl(eval_dataset or cfg["paths"]["dpo_standard_eval"])
@@ -236,12 +237,12 @@ def evaluate_dpo(
     policy = load_policy(cfg, adapter_path=adapter_path, trainable=False)
     reward_model, reward_tok = load_reward_model(cfg)
 
-    beta = float(cfg.get("beta", 0.10))
+    beta_val = float(cfg.get("beta", 0.10) if beta is None else beta)
 
-    print(f"Evaluating: {run_name} ({adapter_path})")
+    print(f"Evaluating: {run_name} ({adapter_path}) | Beta: {beta_val}")
     print(f"Loaded {len(eval_rows)} evaluation examples.")
 
-    pref_metrics = evaluate_preference_loss(policy, eval_rows, tokenizer, cfg, beta, batch_size=2)
+    pref_metrics = evaluate_preference_loss(policy, eval_rows, tokenizer, cfg, beta_val, batch_size=2)
     
     # Clear cache before generation passes
     gc.collect()
@@ -254,7 +255,7 @@ def evaluate_dpo(
     results = {
         "run_name": run_name,
         "adapter_path": adapter_path,
-        "beta": beta,
+        "beta": beta_val,
         "eval_dataset": eval_dataset or cfg["paths"]["dpo_standard_eval"],
         **pref_metrics,
         **gen_metrics,
@@ -284,6 +285,7 @@ def main():
     ap.add_argument("--dataset")
     ap.add_argument("--name", default="standard")
     ap.add_argument("--output-dir")
+    ap.add_argument("--beta", type=float)
     args = ap.parse_args()
 
     evaluate_dpo(
