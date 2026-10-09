@@ -39,16 +39,25 @@ def prepare_dpo_run(config_path: str, dataset_path: str | None = None, beta: flo
     set_seed(int(cfg["seed"]))
     path = dataset_path or cfg["paths"]["dpo_standard_train"]
     rows = read_jsonl(path)
-    if max_examples is not None:
-        rows = rows[: int(max_examples)]
-
+    
     tokenizer = load_tokenizer(cfg["base_model"])
+    max_len = int(cfg["max_sequence_length"])
+    valid_rows = []
+    for r in rows:
+        prompt = prompt_messages_from_preference(r)
+        p_ids = tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
+        if len(p_ids) < max_len:
+            valid_rows.append(r)
+            
+    if max_examples is not None:
+        valid_rows = valid_rows[: int(max_examples)]
+
     model = load_policy(cfg, trainable=True, fresh_lora=True)
     loader = DataLoader(
-        rows,
+        valid_rows,
         batch_size=int(cfg["batch_size"]),
         shuffle=True,
-        collate_fn=make_collate(tokenizer, int(cfg["max_sequence_length"])),
+        collate_fn=make_collate(tokenizer, max_len),
     )
     optimizer = AdamW(
         trainable_parameters(model),
@@ -57,7 +66,7 @@ def prepare_dpo_run(config_path: str, dataset_path: str | None = None, beta: flo
     )
     return {
         "cfg": cfg,
-        "rows": rows,
+        "rows": valid_rows,
         "tokenizer": tokenizer,
         "model": model,
         "loader": loader,
