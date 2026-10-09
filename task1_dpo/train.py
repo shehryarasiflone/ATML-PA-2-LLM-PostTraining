@@ -65,24 +65,31 @@ def prepare_dpo_run(config_path: str, dataset_path: str | None = None, beta: flo
     }
 
 
-def get_batch_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def get_batch_logps(
+    logits: torch.Tensor, 
+    input_ids: torch.Tensor, 
+    response_mask: torch.Tensor
+) -> torch.Tensor:
     """
-    Computes the sum of response-token log-probabilities.
-    Masks out prompt tokens (label == -100).
+    Computes the sum of response-token log-probabilities under teacher forcing.
+    logits: [batch_size, seq_len, vocab_size]
+    input_ids: [batch_size, seq_len]
+    response_mask: [batch_size, seq_len] (0 for pad/prompt, 1 for response)
     """
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    
-    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-    token_losses = loss_fct(
-        shift_logits.view(-1, shift_logits.size(-1)), 
-        shift_labels.view(-1)
-    )
-    token_losses = token_losses.view(shift_labels.size())
-    
-    mask = (shift_labels != -100)
-    token_logps = -token_losses * mask
-    return token_logps.sum(dim=-1)
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    shift_mask = response_mask[:, 1:].contiguous()
+
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+
+    per_token_logps = torch.gather(
+        log_probs, 
+        dim=-1, 
+        index=shift_labels.unsqueeze(-1)
+    ).squeeze(-1)
+
+    sequence_logps = (per_token_logps * shift_mask).sum(dim=-1)
+    return sequence_logps
 
 def run_training(config_path: str, run_name: str, dataset_path: str | None = None, output_path: str | None = None, beta: float | None = None, max_examples: int | None = None):
     bundle = prepare_dpo_run(config_path, dataset_path, beta, max_examples)
@@ -108,17 +115,37 @@ def run_training(config_path: str, run_name: str, dataset_path: str | None = Non
         rejected_batch = {k: v.to(model.device) for k, v in rejected_batch.items()}
         
         with torch.no_grad():
-            ref_chosen_logits = ref_model(**chosen_batch).logits
-            ref_rejected_logits = ref_model(**rejected_batch).logits
+            ref_chosen_logits = ref_model(
+                input_ids=chosen_batch["input_ids"],
+                attention_mask=chosen_batch["attention_mask"]
+            ).logits
+            ref_rejected_logits = ref_model(
+                input_ids=rejected_batch["input_ids"],
+                attention_mask=rejected_batch["attention_mask"]
+            ).logits
             
-            ref_chosen_logps = get_batch_logps(ref_chosen_logits, chosen_batch["labels"])
-            ref_rejected_logps = get_batch_logps(ref_rejected_logits, rejected_batch["labels"])
+            ref_chosen_logps = get_batch_logps(
+                ref_chosen_logits, chosen_batch["input_ids"], chosen_batch["response_mask"]
+            )
+            ref_rejected_logps = get_batch_logps(
+                ref_rejected_logits, rejected_batch["input_ids"], rejected_batch["response_mask"]
+            )
             
-        policy_chosen_logits = model(**chosen_batch).logits
-        policy_rejected_logits = model(**rejected_batch).logits
+        policy_chosen_logits = model(
+            input_ids=chosen_batch["input_ids"],
+            attention_mask=chosen_batch["attention_mask"]
+        ).logits
+        policy_rejected_logits = model(
+            input_ids=rejected_batch["input_ids"],
+            attention_mask=rejected_batch["attention_mask"]
+        ).logits
         
-        policy_chosen_logps = get_batch_logps(policy_chosen_logits, chosen_batch["labels"])
-        policy_rejected_logps = get_batch_logps(policy_rejected_logits, rejected_batch["labels"])
+        policy_chosen_logps = get_batch_logps(
+            policy_chosen_logits, chosen_batch["input_ids"], chosen_batch["response_mask"]
+        )
+        policy_rejected_logps = get_batch_logps(
+            policy_rejected_logits, rejected_batch["input_ids"], rejected_batch["response_mask"]
+        )
         
         loss, metrics = dpo_loss(
             policy_chosen_logp=policy_chosen_logps,
@@ -127,13 +154,18 @@ def run_training(config_path: str, run_name: str, dataset_path: str | None = Non
             ref_rejected_logp=ref_rejected_logps,
             beta=beta_val
         )
-        
+
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
         
         if step % 10 == 0:
-            print(f"Step {step} | Loss: {loss.item():.4f} | Pref Acc: {metrics['preference_accuracy']:.2f}")
+            print(
+                f"Step {step:03d} | "
+                f"Loss: {loss.item():.4f} | "
+                f"Pref Acc: {metrics['preference_accuracy'].item():.2f} | "
+                f"Policy Margin: {metrics['policy_margin_mean'].item():.3f}"
+            )
 
     print(f"Saving checkpoint to {output}")
     model.save_pretrained(output)
