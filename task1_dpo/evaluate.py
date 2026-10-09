@@ -95,6 +95,7 @@ def evaluate_preference_loss(
     }
 
 
+@torch.no_grad()
 def evaluate_generations_and_rewards(
     policy,
     reward_model,
@@ -134,27 +135,34 @@ def evaluate_generations_and_rewards(
             do_sample=do_sample,
         )
 
+        # Clone tensors to detach them from inference mode
+        sequences = gen["sequences"].clone()
+        attention_mask = gen["attention_mask"].clone()
+        response_ids = gen["response_ids"].clone()
+        response_mask = gen["response_mask"].clone()
+        prompt_width = gen["prompt_width"]
+
         # 2. Token-level log-probs under Policy
         pol_tok_logp, _ = response_token_logprobs(
             model=policy,
-            sequences=gen["sequences"],
-            attention_mask=gen["attention_mask"],
-            prompt_width=gen["prompt_width"],
-            response_ids=gen["response_ids"],
+            sequences=sequences,
+            attention_mask=attention_mask,
+            prompt_width=prompt_width,
+            response_ids=response_ids,
         )
 
         # 3. Token-level log-probs under Reference
         with reference_mode(policy):
             ref_tok_logp, _ = response_token_logprobs(
                 model=policy,
-                sequences=gen["sequences"],
-                attention_mask=gen["attention_mask"],
-                prompt_width=gen["prompt_width"],
-                response_ids=gen["response_ids"],
+                sequences=sequences,
+                attention_mask=attention_mask,
+                prompt_width=prompt_width,
+                response_ids=response_ids,
             )
 
         # 4. Token-level Sampled KL
-        kl = sampled_kl(pol_tok_logp, ref_tok_logp, gen["response_mask"])
+        kl = sampled_kl(pol_tok_logp, ref_tok_logp, response_mask)
         all_kls.append(kl.item())
 
         # 5. Reward Model Scoring
@@ -183,7 +191,7 @@ def evaluate_generations_and_rewards(
         if (i // batch_size) % 25 == 0:
             print(f"Evaluated {min(i + batch_size, total_prompts)} / {total_prompts} generation prompts...")
 
-        del gen, pol_tok_logp, ref_tok_logp, rewards
+        del gen, sequences, attention_mask, response_ids, response_mask, pol_tok_logp, ref_tok_logp, rewards
         torch.cuda.empty_cache()
 
     lengths_np = np.array(all_lengths)
