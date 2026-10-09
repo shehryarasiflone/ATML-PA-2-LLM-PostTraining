@@ -65,17 +65,78 @@ def prepare_dpo_run(config_path: str, dataset_path: str | None = None, beta: flo
     }
 
 
+def get_batch_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the sum of response-token log-probabilities.
+    Masks out prompt tokens (label == -100).
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+    token_losses = loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)), 
+        shift_labels.view(-1)
+    )
+    token_losses = token_losses.view(shift_labels.size())
+    
+    mask = (shift_labels != -100)
+    token_logps = -token_losses * mask
+    return token_logps.sum(dim=-1)
+
 def run_training(config_path: str, run_name: str, dataset_path: str | None = None, output_path: str | None = None, beta: float | None = None, max_examples: int | None = None):
     bundle = prepare_dpo_run(config_path, dataset_path, beta, max_examples)
     cfg = bundle["cfg"]
     output = repo_path(output_path or cfg["standard_output"])
     output.parent.mkdir(parents=True, exist_ok=True)
+    
+    model = bundle["model"]
+    tokenizer = bundle["tokenizer"]
+    optimizer = bundle["optimizer"]
+    loader = bundle["loader"]
+    beta_val = bundle["beta"]
+    
+    ref_model = load_policy(cfg, trainable=False)
+    
+    model.train()
+    ref_model.eval()
+    
+    print(f"Starting DPO Training: {run_name} (Beta: {beta_val})")
+    
+    for step, (chosen_batch, rejected_batch) in enumerate(loader):
+        chosen_batch = {k: v.to(model.device) for k, v in chosen_batch.items()}
+        rejected_batch = {k: v.to(model.device) for k, v in rejected_batch.items()}
+        
+        with torch.no_grad():
+            ref_chosen_logits = ref_model(**chosen_batch).logits
+            ref_rejected_logits = ref_model(**rejected_batch).logits
+            
+            ref_chosen_logps = get_batch_logps(ref_chosen_logits, chosen_batch["labels"])
+            ref_rejected_logps = get_batch_logps(ref_rejected_logits, rejected_batch["labels"])
+            
+        policy_chosen_logits = model(**chosen_batch).logits
+        policy_rejected_logits = model(**rejected_batch).logits
+        
+        policy_chosen_logps = get_batch_logps(policy_chosen_logits, chosen_batch["labels"])
+        policy_rejected_logps = get_batch_logps(policy_rejected_logits, rejected_batch["labels"])
+        
+        loss, metrics = dpo_loss(
+            policy_chosen_logp=policy_chosen_logps,
+            policy_rejected_logp=policy_rejected_logps,
+            ref_chosen_logp=ref_chosen_logps,
+            ref_rejected_logp=ref_rejected_logps,
+            beta=beta_val
+        )
+        
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        if step % 10 == 0:
+            print(f"Step {step} | Loss: {loss.item():.4f} | Pref Acc: {metrics['preference_accuracy']:.2f}")
 
-    raise NotImplementedError(
-        "TODO(student): implement the DPO optimization loop, logging, gradient accumulation, "
-        "reference-policy computation, and checkpoint saving. Validate task1_dpo.dpo.dpo_loss "
-        "against the manual before trusting results."
-    )
+    print(f"Saving checkpoint to {output}")
+    model.save_pretrained(output)
 
 
 def main():
