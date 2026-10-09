@@ -159,7 +159,7 @@ def encode_prompt_response(
     assert len(ids) <= max_length
     assert len(ids) == len(response_mask)
 
-    return ids, response_maskk
+    return ids, response_mask
 
 
 def pad_batch(tokenizer, examples: list[tuple[list[int], list[int]]]):
