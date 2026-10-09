@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +41,7 @@ def evaluate_preference_loss(
     tokenizer,
     cfg: dict,
     beta: float,
-    batch_size: int = 4,
+    batch_size: int = 2,
 ) -> dict:
     """Evaluate DPO loss and preference accuracy across held-out pairs."""
     max_len = int(cfg["max_sequence_length"])
@@ -100,7 +102,7 @@ def evaluate_generations_and_rewards(
     rows: list[dict],
     tokenizer,
     cfg: dict,
-    batch_size: int = 8,
+    batch_size: int = 2,
 ) -> dict:
     """Generate responses on held-out prompts, compute reward score, KL, and length stats."""
     prompts = [prompt_messages_from_preference(r) for r in rows]
@@ -116,7 +118,8 @@ def evaluate_generations_and_rewards(
     all_kls = []
     sample_outputs = []
 
-    for i in range(0, len(prompts), batch_size):
+    total_prompts = len(prompts)
+    for i in range(0, total_prompts, batch_size):
         b_prompts = prompts[i : i + batch_size]
 
         # 1. Generate completions under evaluation policy
@@ -164,7 +167,7 @@ def evaluate_generations_and_rewards(
         all_rewards.extend(rewards.cpu().tolist())
         all_lengths.extend(gen["response_lengths"])
 
-        # Cache initial qualitative samples for report analysis
+        # Retain qualitative samples for report analysis
         if len(sample_outputs) < 10:
             for prompt_i, resp_i, r_i, len_i in zip(
                 b_prompts, gen["responses"], rewards.cpu().tolist(), gen["response_lengths"]
@@ -176,6 +179,12 @@ def evaluate_generations_and_rewards(
                         "reward_score": round(float(r_i), 4),
                         "response_length": int(len_i),
                     })
+
+        if (i // batch_size) % 25 == 0:
+            print(f"Evaluated {min(i + batch_size, total_prompts)} / {total_prompts} generation prompts...")
+
+        del gen, pol_tok_logp, ref_tok_logp, rewards
+        torch.cuda.empty_cache()
 
     lengths_np = np.array(all_lengths)
     q75, q25 = np.percentile(lengths_np, [75, 25])
@@ -203,6 +212,7 @@ def evaluate_dpo(
     cfg = load_yaml(config_path)
     eval_rows = read_jsonl(eval_dataset or cfg["paths"]["dpo_standard_eval"])
     tokenizer = load_tokenizer(cfg["base_model"])
+
     def get_token_count(msgs):
         out = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True)
         if isinstance(out, dict) or hasattr(out, "input_ids"):
@@ -214,6 +224,7 @@ def evaluate_dpo(
         r for r in eval_rows
         if get_token_count(prompt_messages_from_preference(r)) < max_len
     ]
+
     policy = load_policy(cfg, adapter_path=adapter_path, trainable=False)
     reward_model, reward_tok = load_reward_model(cfg)
 
@@ -222,8 +233,15 @@ def evaluate_dpo(
     print(f"Evaluating: {run_name} ({adapter_path})")
     print(f"Loaded {len(eval_rows)} evaluation examples.")
 
-    pref_metrics = evaluate_preference_loss(policy, eval_rows, tokenizer, cfg, beta)
-    gen_metrics = evaluate_generations_and_rewards(policy, reward_model, reward_tok, eval_rows, tokenizer, cfg)
+    pref_metrics = evaluate_preference_loss(policy, eval_rows, tokenizer, cfg, beta, batch_size=2)
+    
+    # Clear cache before generation passes
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    gen_metrics = evaluate_generations_and_rewards(
+        policy, reward_model, reward_tok, eval_rows, tokenizer, cfg, batch_size=2
+    )
 
     results = {
         "run_name": run_name,
