@@ -8,7 +8,7 @@ import time
 import warnings
 from pathlib import Path
 
-# Silence repetitive 8-bit quantized matrix multiplication warnings
+# Silence 8-bit quantized matrix multiplication warnings
 warnings.filterwarnings("ignore", message=".*MatMul8bitLt.*")
 warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes")
 logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
@@ -31,7 +31,6 @@ from common.models import (
     load_tokenizer,
     load_value_model,
     reference_mode,
-    token_values,
     trainable_parameters,
     value_parameter_groups,
 )
@@ -40,8 +39,40 @@ from task2_ppo.ppo import (
     normalize_advantages,
     ppo_policy_loss,
     shaped_rewards,
-    value_mse_loss,
 )
+
+
+def get_token_values_fp32(value_model, input_ids, attention_mask):
+    """Compute token-level scalar values in float32 to prevent half-precision overflow."""
+    backbone = getattr(value_model, value_model.base_model_prefix)
+    outputs = backbone(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        return_dict=True,
+        use_cache=False,
+    )
+    hidden = outputs.hidden_states[-1]
+    head = getattr(value_model, "score", getattr(value_model, "classifier", None))
+    if head is None:
+        raise RuntimeError("Could not locate scalar value head")
+    
+    # Project in float32
+    return head(hidden.float()).squeeze(-1).float()
+
+
+def clipped_value_loss(pred_values, old_values, returns, mask, eps=0.2):
+    """Standard PPO clipped value loss in float32."""
+    v_pred = pred_values.float()
+    v_old = old_values.float()
+    v_ret = returns.float()
+    
+    vf_loss1 = (v_pred - v_ret) ** 2
+    v_clipped = v_old + (v_pred - v_old).clamp(-eps, eps)
+    vf_loss2 = (v_clipped - v_ret) ** 2
+    
+    loss = 0.5 * torch.max(vf_loss1, vf_loss2)
+    return masked_mean(loss, mask)
 
 
 def prepare_ppo_continuation(config_path: str):
@@ -59,12 +90,19 @@ def prepare_ppo_continuation(config_path: str):
         cfg["paths"]["ppo_midpoint_value"],
         train_mode=cfg.get("value_train_mode", "lora_head"),
     )
+
+    # Cast value head weights to float32 to guarantee stability
+    for name, p in value_model.named_parameters():
+        if "score" in name or "classifier" in name:
+            p.data = p.data.float()
+
     reward_model, reward_tokenizer = load_reward_model(cfg)
     prompts = read_jsonl(cfg["paths"]["rl_prompt_train"])
 
     policy_optimizer = AdamW(
         trainable_parameters(policy),
         lr=float(cfg["policy_learning_rate"]),
+        eps=1e-5,
     )
     value_optimizer = AdamW(
         value_parameter_groups(
@@ -73,6 +111,7 @@ def prepare_ppo_continuation(config_path: str):
             head_lr=float(cfg["value_head_learning_rate"]),
         ),
         weight_decay=0.0,
+        eps=1e-5,
     )
 
     return {
@@ -132,7 +171,7 @@ def run_ppo(
 
     print(f"\n=======================================================")
     print(f" Starting PPO Continuation: {run_name}")
-    print(f" Total Updates: {total_updates} | Epsilon: {clip_eps} | KL Beta: {beta_kl}")
+    print(f" Updates: {total_updates} | Epsilon: {clip_eps} | KL Beta: {beta_kl}")
     print(f"=======================================================\n")
 
     history = []
@@ -168,15 +207,14 @@ def run_ppo(
                 do_sample=True,
             )
 
-            # Defensive skip if zero tokens generated
             if gen["response_ids"].shape[1] == 0:
-                print(f"Update {update_idx:02d}: Empty rollout generated, continuing.")
+                print(f"Update {update_idx:02d}: Empty rollout, continuing.")
                 continue
 
-            sequences = gen["sequences"].clone()
-            attention_mask = gen["attention_mask"].clone()
-            response_ids = gen["response_ids"].clone()
-            response_mask = gen["response_mask"].clone()
+            sequences = gen["sequences"].detach().clone()
+            attention_mask = gen["attention_mask"].detach().clone()
+            response_ids = gen["response_ids"].detach().clone()
+            response_mask = gen["response_mask"].detach().clone()
             prompt_width = gen["prompt_width"]
 
             # Compute Old Policy Log-probs
@@ -198,8 +236,8 @@ def run_ppo(
                     response_ids=response_ids,
                 )
 
-            # Compute Old Value Estimates
-            full_values = token_values(value_model, sequences, attention_mask)
+            # Compute Old Values in float32
+            full_values = get_token_values_fp32(value_model, sequences, attention_mask)
             old_values = full_values[:, prompt_width - 1 : -1][:, : response_ids.shape[1]]
 
             # Reward Model Scoring
@@ -217,18 +255,21 @@ def run_ppo(
                 if not terminated:
                     terminal_rewards[b_i] -= missing_eos_pen
 
+            # Clamp terminal reward to reasonable range to prevent runaway returns
+            terminal_rewards = terminal_rewards.clamp(-15.0, 15.0)
+
             token_rewards = shaped_rewards(
                 task_reward=terminal_rewards,
-                policy_logp=old_logp,
-                ref_logp=ref_logp,
+                policy_logp=old_logp.float(),
+                ref_logp=ref_logp.float(),
                 response_mask=response_mask,
                 beta_kl=beta_kl,
             )
 
-            # GAE Advantages and Returns
+            # GAE in float32
             advantages, returns = compute_gae(
-                rewards=token_rewards,
-                values=old_values,
+                rewards=token_rewards.float(),
+                values=old_values.float(),
                 mask=response_mask,
                 gamma=gamma,
                 lam=gae_lam,
@@ -264,7 +305,7 @@ def run_ppo(
                 eps=clip_eps,
             )
 
-            # Underflow-safe token entropy
+            # Entropy
             probs = F.softmax(logits.float(), dim=-1)
             log_probs = F.log_softmax(logits.float(), dim=-1)
             plogp = torch.where(probs > 0, probs * log_probs, torch.zeros_like(probs))
@@ -272,49 +313,39 @@ def run_ppo(
             entropy = masked_mean(token_entropy, response_mask)
 
             # Forward pass: Value Model
-            pred_full_values = token_values(value_model, sequences, attention_mask)
+            pred_full_values = get_token_values_fp32(value_model, sequences, attention_mask)
             pred_values = pred_full_values[:, prompt_width - 1 : -1][:, : response_ids.shape[1]]
-            v_loss = value_mse_loss(pred_values, returns.detach(), response_mask)
+            v_loss = clipped_value_loss(
+                pred_values=pred_values,
+                old_values=old_values.detach(),
+                returns=returns.detach(),
+                mask=response_mask,
+                eps=clip_eps,
+            )
 
-            # Policy Gradient Step with NaN Shield
+            # Policy Optimization
             policy_optimizer.zero_grad()
-            if not (torch.isnan(p_loss) or torch.isinf(p_loss)):
-                p_loss.backward()
-                p_norm_val = torch.nn.utils.clip_grad_norm_(
-                    trainable_parameters(policy), max_grad_norm
-                ).item()
-                if not (torch.isnan(torch.tensor(p_norm_val)) or torch.isinf(torch.tensor(p_norm_val))):
-                    pol_norm = p_norm_val
-                    policy_optimizer.step()
-                else:
-                    policy_optimizer.zero_grad()
-            else:
-                policy_optimizer.zero_grad()
+            p_loss.backward()
+            pol_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_parameters(policy), max_grad_norm
+            ).item()
+            policy_optimizer.step()
 
-            # Value Gradient Step with NaN Shield
+            # Value Optimization
             value_optimizer.zero_grad()
-            if not (torch.isnan(v_loss) or torch.isinf(v_loss)):
-                (value_coef * v_loss).backward()
-                v_norm_val = torch.nn.utils.clip_grad_norm_(
-                    value_model.parameters(), max_grad_norm
-                ).item()
-                if not (torch.isnan(torch.tensor(v_norm_val)) or torch.isinf(torch.tensor(v_norm_val))):
-                    val_norm = v_norm_val
-                    value_optimizer.step()
-                else:
-                    value_optimizer.zero_grad()
-            else:
-                value_optimizer.zero_grad()
+            (value_coef * v_loss).backward()
+            val_norm = torch.nn.utils.clip_grad_norm_(
+                value_model.parameters(), max_grad_norm
+            ).item()
+            value_optimizer.step()
 
-            p_loss_item = p_loss.item() if not torch.isnan(p_loss) else 0.0
-            v_loss_item = v_loss.item() if not torch.isnan(v_loss) else 0.0
-            update_p_loss += p_loss_item / ppo_epochs
-            update_v_loss += v_loss_item / ppo_epochs
+            update_p_loss += p_loss.item() / ppo_epochs
+            update_v_loss += v_loss.item() / ppo_epochs
             update_clip_frac += clip_frac.item() / ppo_epochs
             update_entropy += entropy.item() / ppo_epochs
             update_ratio_mean += masked_mean(ratio, response_mask).item() / ppo_epochs
 
-        # Free rollout variables
+        # Cleanup memory
         del sequences, attention_mask, response_ids, response_mask, old_logp, ref_logp
         del old_values, raw_rewards, token_rewards, advantages, returns, norm_advantages
         gc.collect()
@@ -348,10 +379,10 @@ def run_ppo(
 
         print(
             f"Update {update_idx:02d}/{total_updates:02d} | "
-            f"P Loss: {update_p_loss:.4f} | "
+            f"P Loss: {update_p_loss:+.4f} | "
             f"V Loss: {update_v_loss:.4f} | "
             f"Clip%: {update_clip_frac * 100:.1f}% | "
-            f"Rew: {raw_r_mean:.3f} | "
+            f"Rew: {raw_r_mean:+.3f} | "
             f"Len: {resp_len:.1f} | "
             f"VRAM: {peak_vram:.0f}MB | "
             f"Time: {elapsed:.2f}s"
@@ -361,7 +392,7 @@ def run_ppo(
     print(f"\nSaving final policy checkpoint to: {out}")
     policy.save_pretrained(out)
 
-    # Save training trajectory metrics
+    # Save training trajectory log
     log_file = results_dir / f"{run_name}_train_log.json"
     with log_file.open("w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
