@@ -3,8 +3,15 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import time
+import warnings
 from pathlib import Path
+
+# Silence repetitive 8-bit quantized matrix multiplication warnings
+warnings.filterwarnings("ignore", message=".*MatMul8bitLt.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes")
+logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
 
 import torch
 import torch.nn.functional as F
@@ -257,10 +264,11 @@ def run_ppo(
                 eps=clip_eps,
             )
 
-            # Diagnostic Entropy
+            # Underflow-safe token entropy
             probs = F.softmax(logits.float(), dim=-1)
             log_probs = F.log_softmax(logits.float(), dim=-1)
-            token_entropy = -(probs * log_probs).sum(dim=-1)
+            plogp = torch.where(probs > 0, probs * log_probs, torch.zeros_like(probs))
+            token_entropy = -plogp.sum(dim=-1)
             entropy = masked_mean(token_entropy, response_mask)
 
             # Forward pass: Value Model
@@ -268,29 +276,45 @@ def run_ppo(
             pred_values = pred_full_values[:, prompt_width - 1 : -1][:, : response_ids.shape[1]]
             v_loss = value_mse_loss(pred_values, returns.detach(), response_mask)
 
-            # Policy Step
+            # Policy Gradient Step with NaN Shield
             policy_optimizer.zero_grad()
-            p_loss.backward()
-            pol_norm = torch.nn.utils.clip_grad_norm_(
-                trainable_parameters(policy), max_grad_norm
-            ).item()
-            policy_optimizer.step()
+            if not (torch.isnan(p_loss) or torch.isinf(p_loss)):
+                p_loss.backward()
+                p_norm_val = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters(policy), max_grad_norm
+                ).item()
+                if not (torch.isnan(torch.tensor(p_norm_val)) or torch.isinf(torch.tensor(p_norm_val))):
+                    pol_norm = p_norm_val
+                    policy_optimizer.step()
+                else:
+                    policy_optimizer.zero_grad()
+            else:
+                policy_optimizer.zero_grad()
 
-            # Value Step
+            # Value Gradient Step with NaN Shield
             value_optimizer.zero_grad()
-            (value_coef * v_loss).backward()
-            val_norm = torch.nn.utils.clip_grad_norm_(
-                value_model.parameters(), max_grad_norm
-            ).item()
-            value_optimizer.step()
+            if not (torch.isnan(v_loss) or torch.isinf(v_loss)):
+                (value_coef * v_loss).backward()
+                v_norm_val = torch.nn.utils.clip_grad_norm_(
+                    value_model.parameters(), max_grad_norm
+                ).item()
+                if not (torch.isnan(torch.tensor(v_norm_val)) or torch.isinf(torch.tensor(v_norm_val))):
+                    val_norm = v_norm_val
+                    value_optimizer.step()
+                else:
+                    value_optimizer.zero_grad()
+            else:
+                value_optimizer.zero_grad()
 
-            update_p_loss += p_loss.item() / ppo_epochs
-            update_v_loss += v_loss.item() / ppo_epochs
+            p_loss_item = p_loss.item() if not torch.isnan(p_loss) else 0.0
+            v_loss_item = v_loss.item() if not torch.isnan(v_loss) else 0.0
+            update_p_loss += p_loss_item / ppo_epochs
+            update_v_loss += v_loss_item / ppo_epochs
             update_clip_frac += clip_frac.item() / ppo_epochs
             update_entropy += entropy.item() / ppo_epochs
             update_ratio_mean += masked_mean(ratio, response_mask).item() / ppo_epochs
 
-        # Clean rollout variables
+        # Free rollout variables
         del sequences, attention_mask, response_ids, response_mask, old_logp, ref_logp
         del old_values, raw_rewards, token_rewards, advantages, returns, norm_advantages
         gc.collect()
