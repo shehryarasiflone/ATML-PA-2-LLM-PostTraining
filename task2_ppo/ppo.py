@@ -44,11 +44,15 @@ def shaped_rewards(task_reward, policy_logp, ref_logp, response_mask, beta_kl):
 
 
 def ppo_policy_loss(new_logp, old_logp, advantage, mask, eps=0.2):
-    """Return PPO clipped policy loss and diagnostics."""
-    ratio = torch.exp(new_logp - old_logp)
-    surr1 = ratio * advantage
-    surr2 = ratio.clamp(1.0 - eps, 1.0 + eps) * advantage
+    """Return numerically guarded PPO clipped policy loss and diagnostics."""
+    # Guard against exponent overflow in float16/bfloat16
+    log_ratio = (new_logp.float() - old_logp.float()).clamp(-10.0, 10.0)
+    ratio = torch.exp(log_ratio)
 
+    surr1 = ratio * advantage.float()
+    surr2 = ratio.clamp(1.0 - eps, 1.0 + eps) * advantage.float()
+
+    # Pessimistic lower bound
     objective = torch.minimum(surr1, surr2)
 
     loss = -masked_mean(objective, mask)
@@ -57,8 +61,10 @@ def ppo_policy_loss(new_logp, old_logp, advantage, mask, eps=0.2):
     return loss, ratio.detach(), clip_fraction.detach()
 
 
-def value_mse_loss(predicted_values, returns, mask):
-    return masked_mean((predicted_values - returns) ** 2, mask)
+def value_mse_loss(predicted_values, returns, mask, clip_diff=10.0):
+    """Compute value MSE in float32 with clamped differences to prevent critic explosion."""
+    diff = (predicted_values.float() - returns.float()).clamp(-clip_diff, clip_diff)
+    return masked_mean(diff ** 2, mask)
 
 
 def normalize_advantages(advantages, mask, eps=1e-6):
@@ -67,4 +73,6 @@ def normalize_advantages(advantages, mask, eps=1e-6):
         return advantages
     mean = valid.mean()
     std = valid.std(unbiased=False).clamp_min(eps)
-    return ((advantages - mean) / std) * mask
+    normed = ((advantages - mean) / std) * mask
+    # Standard PPO outlier clipping to stabilize single-sample rollouts
+    return normed.clamp(-5.0, 5.0) * mask
