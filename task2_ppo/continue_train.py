@@ -31,6 +31,7 @@ from common.models import (
     load_tokenizer,
     load_value_model,
     reference_mode,
+    token_values,
     trainable_parameters,
     value_parameter_groups,
 )
@@ -39,40 +40,8 @@ from task2_ppo.ppo import (
     normalize_advantages,
     ppo_policy_loss,
     shaped_rewards,
+    value_mse_loss,
 )
-
-
-def get_token_values_fp32(value_model, input_ids, attention_mask):
-    """Compute token-level scalar values in float32 to prevent half-precision overflow."""
-    backbone = getattr(value_model, value_model.base_model_prefix)
-    outputs = backbone(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-        return_dict=True,
-        use_cache=False,
-    )
-    hidden = outputs.hidden_states[-1]
-    head = getattr(value_model, "score", getattr(value_model, "classifier", None))
-    if head is None:
-        raise RuntimeError("Could not locate scalar value head")
-    
-    # Project in float32
-    return head(hidden.float()).squeeze(-1).float()
-
-
-def clipped_value_loss(pred_values, old_values, returns, mask, eps=0.2):
-    """Standard PPO clipped value loss in float32."""
-    v_pred = pred_values.float()
-    v_old = old_values.float()
-    v_ret = returns.float()
-    
-    vf_loss1 = (v_pred - v_ret) ** 2
-    v_clipped = v_old + (v_pred - v_old).clamp(-eps, eps)
-    vf_loss2 = (v_clipped - v_ret) ** 2
-    
-    loss = 0.5 * torch.max(vf_loss1, vf_loss2)
-    return masked_mean(loss, mask)
 
 
 def prepare_ppo_continuation(config_path: str):
@@ -90,19 +59,12 @@ def prepare_ppo_continuation(config_path: str):
         cfg["paths"]["ppo_midpoint_value"],
         train_mode=cfg.get("value_train_mode", "lora_head"),
     )
-
-    # Cast value head weights to float32 to guarantee stability
-    for name, p in value_model.named_parameters():
-        if "score" in name or "classifier" in name:
-            p.data = p.data.float()
-
     reward_model, reward_tokenizer = load_reward_model(cfg)
     prompts = read_jsonl(cfg["paths"]["rl_prompt_train"])
 
     policy_optimizer = AdamW(
         trainable_parameters(policy),
         lr=float(cfg["policy_learning_rate"]),
-        eps=1e-5,
     )
     value_optimizer = AdamW(
         value_parameter_groups(
@@ -111,7 +73,6 @@ def prepare_ppo_continuation(config_path: str):
             head_lr=float(cfg["value_head_learning_rate"]),
         ),
         weight_decay=0.0,
-        eps=1e-5,
     )
 
     return {
@@ -217,7 +178,7 @@ def run_ppo(
             response_mask = gen["response_mask"].detach().clone()
             prompt_width = gen["prompt_width"]
 
-            # Compute Old Policy Log-probs
+            # Policy Log-probs
             old_logp, _ = response_token_logprobs(
                 model=policy,
                 sequences=sequences,
@@ -226,7 +187,7 @@ def run_ppo(
                 response_ids=response_ids,
             )
 
-            # Compute Reference Log-probs
+            # Reference Log-probs
             with reference_mode(policy):
                 ref_logp, _ = response_token_logprobs(
                     model=policy,
@@ -236,8 +197,8 @@ def run_ppo(
                     response_ids=response_ids,
                 )
 
-            # Compute Old Values in float32
-            full_values = get_token_values_fp32(value_model, sequences, attention_mask)
+            # Value Estimates
+            full_values = token_values(value_model, sequences, attention_mask)
             old_values = full_values[:, prompt_width - 1 : -1][:, : response_ids.shape[1]]
 
             # Reward Model Scoring
@@ -255,21 +216,18 @@ def run_ppo(
                 if not terminated:
                     terminal_rewards[b_i] -= missing_eos_pen
 
-            # Clamp terminal reward to reasonable range to prevent runaway returns
-            terminal_rewards = terminal_rewards.clamp(-15.0, 15.0)
-
             token_rewards = shaped_rewards(
                 task_reward=terminal_rewards,
-                policy_logp=old_logp.float(),
-                ref_logp=ref_logp.float(),
+                policy_logp=old_logp,
+                ref_logp=ref_logp,
                 response_mask=response_mask,
                 beta_kl=beta_kl,
             )
 
-            # GAE in float32
+            # GAE Advantages and Returns
             advantages, returns = compute_gae(
-                rewards=token_rewards.float(),
-                values=old_values.float(),
+                rewards=token_rewards,
+                values=old_values,
                 mask=response_mask,
                 gamma=gamma,
                 lam=gae_lam,
@@ -305,7 +263,7 @@ def run_ppo(
                 eps=clip_eps,
             )
 
-            # Entropy
+            # Diagnostic Entropy
             probs = F.softmax(logits.float(), dim=-1)
             log_probs = F.log_softmax(logits.float(), dim=-1)
             plogp = torch.where(probs > 0, probs * log_probs, torch.zeros_like(probs))
@@ -313,15 +271,9 @@ def run_ppo(
             entropy = masked_mean(token_entropy, response_mask)
 
             # Forward pass: Value Model
-            pred_full_values = get_token_values_fp32(value_model, sequences, attention_mask)
+            pred_full_values = token_values(value_model, sequences, attention_mask)
             pred_values = pred_full_values[:, prompt_width - 1 : -1][:, : response_ids.shape[1]]
-            v_loss = clipped_value_loss(
-                pred_values=pred_values,
-                old_values=old_values.detach(),
-                returns=returns.detach(),
-                mask=response_mask,
-                eps=clip_eps,
-            )
+            v_loss = value_mse_loss(pred_values, returns.detach(), response_mask)
 
             # Policy Optimization
             policy_optimizer.zero_grad()
@@ -345,7 +297,7 @@ def run_ppo(
             update_entropy += entropy.item() / ppo_epochs
             update_ratio_mean += masked_mean(ratio, response_mask).item() / ppo_epochs
 
-        # Cleanup memory
+        # Free rollout memory
         del sequences, attention_mask, response_ids, response_mask, old_logp, ref_logp
         del old_values, raw_rewards, token_rewards, advantages, returns, norm_advantages
         gc.collect()
