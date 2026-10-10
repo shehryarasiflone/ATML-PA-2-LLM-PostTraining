@@ -6,17 +6,13 @@ from common.metrics import masked_mean
 
 
 def compute_gae(rewards, values, mask, gamma=1.0, lam=0.95):
-    """Token-level GAE over response positions.
-
-    rewards, values, mask: [batch, response_steps]. Padding positions must have mask=0.
-    The final valid response position bootstraps with zero.
-    """
+    """Token-level GAE over response positions strictly in float32."""
     batch, steps = rewards.shape
-    advantages = torch.zeros_like(rewards, dtype=torch.float32)
+    advantages = torch.zeros((batch, steps), device=rewards.device, dtype=torch.float32)
     last_adv = torch.zeros(batch, device=rewards.device, dtype=torch.float32)
 
-    r_f = rewards.float()
-    v_f = values.float()
+    r_f = torch.nan_to_num(rewards.float(), nan=0.0)
+    v_f = torch.nan_to_num(values.float(), nan=0.0)
     m_f = mask.float()
 
     for t in reversed(range(steps)):
@@ -38,7 +34,7 @@ def compute_gae(rewards, values, mask, gamma=1.0, lam=0.95):
 
 
 def shaped_rewards(task_reward, policy_logp, ref_logp, response_mask, beta_kl):
-    """Sampled-action KL shaping plus terminal learned reward with bounded penalties."""
+    """Sampled-action KL shaping plus terminal learned reward."""
     kl_diff = (policy_logp.float() - ref_logp.float()).clamp(-10.0, 10.0)
     rewards = -float(beta_kl) * kl_diff * response_mask.float()
     for b in range(rewards.shape[0]):
@@ -49,7 +45,7 @@ def shaped_rewards(task_reward, policy_logp, ref_logp, response_mask, beta_kl):
 
 
 def ppo_policy_loss(new_logp, old_logp, advantage, mask, eps=0.2):
-    """Return PPO clipped policy loss and diagnostics with exponent guard."""
+    """Numerically guarded PPO clipped policy loss."""
     log_ratio = (new_logp.float() - old_logp.float()).clamp(-10.0, 10.0)
     ratio = torch.exp(log_ratio)
 
@@ -65,9 +61,11 @@ def ppo_policy_loss(new_logp, old_logp, advantage, mask, eps=0.2):
     return loss, ratio.detach(), clip_fraction.detach()
 
 
-def value_mse_loss(predicted_values, returns, mask, clip_diff=50.0):
-    """Compute value MSE with bounded residuals to prevent float16 overflow."""
-    diff = (predicted_values.float() - returns.float()).clamp(-clip_diff, clip_diff)
+def value_mse_loss(predicted_values, returns, mask, clip_diff=10.0):
+    """Compute value MSE with bounded residuals strictly in float32."""
+    p_val = torch.nan_to_num(predicted_values.float(), nan=0.0)
+    ret = torch.nan_to_num(returns.float(), nan=0.0)
+    diff = (p_val - ret).clamp(-clip_diff, clip_diff)
     return masked_mean(diff ** 2, mask)
 
 

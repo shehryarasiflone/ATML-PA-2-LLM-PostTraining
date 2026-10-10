@@ -44,6 +44,38 @@ from task2_ppo.ppo import (
 )
 
 
+def safe_clip_grad_norm(parameters, max_norm: float = 1.0) -> float:
+    """Clip gradients safely in float32 to prevent float16 norm overflow to inf/nan."""
+    params = [p for p in parameters if p.grad is not None]
+    if not params:
+        return 0.0
+
+    # Sanitize wild values before norm calculation
+    for p in params:
+        p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # Compute Euclidean norm in float32
+    total_norm_sq = torch.zeros(1, dtype=torch.float32, device=params[0].device)
+    for p in params:
+        p_norm = torch.norm(p.grad.detach().float(), 2)
+        total_norm_sq += p_norm ** 2
+    total_norm = torch.sqrt(total_norm_sq).item()
+
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1.0:
+        for p in params:
+            p.grad.detach().mul_(clip_coef)
+
+    return total_norm
+
+
+def sanitize_model_weights(model):
+    """Defensive sanitation to ensure no NaNs or Infs persist in model parameters."""
+    for p in model.parameters():
+        if p.requires_grad and (torch.isnan(p.data).any() or torch.isinf(p.data).any()):
+            p.data = torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0)
+
+
 def prepare_ppo_continuation(config_path: str):
     cfg = load_yaml(config_path)
     set_seed(int(cfg["seed"]))
@@ -65,6 +97,7 @@ def prepare_ppo_continuation(config_path: str):
     policy_optimizer = AdamW(
         trainable_parameters(policy),
         lr=float(cfg["policy_learning_rate"]),
+        eps=1e-5,
     )
     value_optimizer = AdamW(
         value_parameter_groups(
@@ -73,6 +106,7 @@ def prepare_ppo_continuation(config_path: str):
             head_lr=float(cfg["value_head_learning_rate"]),
         ),
         weight_decay=0.0,
+        eps=1e-5,
     )
 
     return {
@@ -216,6 +250,8 @@ def run_ppo(
                 if not terminated:
                     terminal_rewards[b_i] -= missing_eos_pen
 
+            terminal_rewards = terminal_rewards.clamp(-15.0, 15.0)
+
             token_rewards = shaped_rewards(
                 task_reward=terminal_rewards,
                 policy_logp=old_logp,
@@ -224,7 +260,7 @@ def run_ppo(
                 beta_kl=beta_kl,
             )
 
-            # GAE Advantages and Returns
+            # GAE in float32
             advantages, returns = compute_gae(
                 rewards=token_rewards,
                 values=old_values,
@@ -263,7 +299,7 @@ def run_ppo(
                 eps=clip_eps,
             )
 
-            # Diagnostic Entropy
+            # Entropy
             probs = F.softmax(logits.float(), dim=-1)
             log_probs = F.log_softmax(logits.float(), dim=-1)
             plogp = torch.where(probs > 0, probs * log_probs, torch.zeros_like(probs))
@@ -275,21 +311,19 @@ def run_ppo(
             pred_values = pred_full_values[:, prompt_width - 1 : -1][:, : response_ids.shape[1]]
             v_loss = value_mse_loss(pred_values, returns.detach(), response_mask)
 
-            # Policy Optimization
+            # Policy Optimization with Safe Clipping
             policy_optimizer.zero_grad()
             p_loss.backward()
-            pol_norm = torch.nn.utils.clip_grad_norm_(
-                trainable_parameters(policy), max_grad_norm
-            ).item()
+            pol_norm = safe_clip_grad_norm(trainable_parameters(policy), max_grad_norm)
             policy_optimizer.step()
+            sanitize_model_weights(policy)
 
-            # Value Optimization
+            # Value Optimization with Safe Clipping
             value_optimizer.zero_grad()
             (value_coef * v_loss).backward()
-            val_norm = torch.nn.utils.clip_grad_norm_(
-                value_model.parameters(), max_grad_norm
-            ).item()
+            val_norm = safe_clip_grad_norm(value_model.parameters(), max_grad_norm)
             value_optimizer.step()
+            sanitize_model_weights(value_model)
 
             update_p_loss += p_loss.item() / ppo_epochs
             update_v_loss += v_loss.item() / ppo_epochs
