@@ -382,6 +382,10 @@ def run_ppo(
     log_file = results_dir / f"{run_name}_train_log.json"
     with log_file.open("w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+    del policy, value_model, reward_model, tokenizer, policy_optimizer, value_optimizer, bundle
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     print(f"Saved update metrics to: {log_file}\n")
 
 

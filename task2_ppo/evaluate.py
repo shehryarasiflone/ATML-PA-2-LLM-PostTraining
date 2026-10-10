@@ -7,13 +7,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from common.data import load_yaml, prompt_messages, read_jsonl, repo_path
-from common.generation import (
-    batch_generate,
-    response_token_logprobs,
-    score_reward_pairs,
-)
+from common.generation import batch_generate, score_reward_pairs
 from common.metrics import sampled_kl
 from common.models import (
     clear_gpu,
@@ -24,13 +21,34 @@ from common.models import (
 )
 
 
+def safe_response_logprobs(model, sequences, attention_mask, prompt_width, response_ids):
+    """Compute response log-probs per-sample to avoid giant [B, T, V] float32 allocations."""
+    batch_size = sequences.shape[0]
+    all_logp = []
+    for b in range(batch_size):
+        seq_b = sequences[b : b + 1]
+        attn_b = attention_mask[b : b + 1]
+        resp_b = response_ids[b : b + 1]
+        resp_len = resp_b.shape[1]
+
+        outputs = model(input_ids=seq_b, attention_mask=attn_b, use_cache=False, return_dict=True)
+        # Shift logits to align with next-token prediction
+        logits = outputs.logits[:, prompt_width - 1 : prompt_width + resp_len - 1, :]
+        logp = F.log_softmax(logits.float(), dim=-1)
+        chosen = torch.gather(logp, -1, resp_b.unsqueeze(-1)).squeeze(-1)
+        all_logp.append(chosen)
+
+        del outputs, logits, logp
+    return torch.cat(all_logp, dim=0)
+
+
 @torch.no_grad()
 def evaluate_ppo(
     config_path: str,
     adapter_path: str,
     run_name: str = "standard",
     output_dir: str | None = None,
-    batch_size: int = 8,  # Increased from 2 to 8 for ~4x faster evaluation
+    batch_size: int = 4,
 ) -> dict:
     cfg = load_yaml(config_path)
     rows = read_jsonl(cfg["paths"]["rl_prompt_eval"])
@@ -68,14 +86,14 @@ def evaluate_ppo(
             do_sample=True,
         )
 
-        sequences = gen["sequences"].clone()
-        attention_mask = gen["attention_mask"].clone()
-        response_ids = gen["response_ids"].clone()
-        response_mask = gen["response_mask"].clone()
+        sequences = gen["sequences"]
+        attention_mask = gen["attention_mask"]
+        response_ids = gen["response_ids"]
+        response_mask = gen["response_mask"]
         prompt_width = gen["prompt_width"]
 
         # Policy Log-probs
-        pol_tok_logp, _ = response_token_logprobs(
+        pol_tok_logp = safe_response_logprobs(
             model=policy,
             sequences=sequences,
             attention_mask=attention_mask,
@@ -85,7 +103,7 @@ def evaluate_ppo(
 
         # Reference Log-probs
         with reference_mode(policy):
-            ref_tok_logp, _ = response_token_logprobs(
+            ref_tok_logp = safe_response_logprobs(
                 model=policy,
                 sequences=sequences,
                 attention_mask=attention_mask,
@@ -121,12 +139,12 @@ def evaluate_ppo(
                         "length": int(l_i),
                     })
 
-        # Regular visible progress updates every ~24-32 prompts
         processed = min(i + len(b_prompts), total_prompts)
-        if processed % 24 == 0 or processed == total_prompts:
+        if processed % 20 == 0 or processed == total_prompts:
             print(f"Evaluated {processed:03d} / {total_prompts} prompts...")
 
         del gen, sequences, attention_mask, response_ids, response_mask, pol_tok_logp, ref_tok_logp, rewards
+        gc.collect()
         torch.cuda.empty_cache()
 
     lengths_np = np.array(all_lengths)
@@ -161,6 +179,8 @@ def evaluate_ppo(
     print(f"Saved results to: {out_file}\n")
 
     clear_gpu(policy, reward_model)
+    gc.collect()
+    torch.cuda.empty_cache()
     return results
 
 
@@ -170,7 +190,7 @@ def main():
     ap.add_argument("--adapter", required=True)
     ap.add_argument("--name", default="standard")
     ap.add_argument("--output-dir")
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--batch-size", type=int, default=4)
     args = ap.parse_args()
     evaluate_ppo(
         config_path=args.config,
