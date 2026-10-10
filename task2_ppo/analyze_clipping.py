@@ -208,7 +208,7 @@ def run_clipping_forks(cfg: dict, config_path: str):
             config_path=config_path,
             adapter_path=out_adapter,
             run_name=run_name,
-            batch_size=2,
+            batch_size=8,
         )
 
         # Load training log to compute optimization stability statistics

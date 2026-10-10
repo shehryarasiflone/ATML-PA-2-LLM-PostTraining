@@ -24,25 +24,13 @@ from common.models import (
 )
 
 
-def load_evaluation_bundle(config_path: str, adapter: str):
-    cfg = load_yaml(config_path)
-    return {
-        "cfg": cfg,
-        "rows": read_jsonl(cfg["paths"]["rl_prompt_eval"]),
-        "tokenizer": load_tokenizer(cfg["base_model"]),
-        "policy": load_policy(cfg, adapter_path=adapter, trainable=False),
-        "reward_model": load_reward_model(cfg)[0],
-        "reward_tokenizer": load_reward_model(cfg)[1],
-    }
-
-
 @torch.no_grad()
 def evaluate_ppo(
     config_path: str,
     adapter_path: str,
     run_name: str = "standard",
     output_dir: str | None = None,
-    batch_size: int = 2,
+    batch_size: int = 8,  # Increased from 2 to 8 for ~4x faster evaluation
 ) -> dict:
     cfg = load_yaml(config_path)
     rows = read_jsonl(cfg["paths"]["rl_prompt_eval"])
@@ -57,7 +45,7 @@ def evaluate_ppo(
     top_p = float(cfg.get("generation", {}).get("top_p", 0.9))
 
     print(f"\nEvaluating PPO Checkpoint: {run_name} ({adapter_path})")
-    print(f"Loaded {len(prompts)} held-out RL evaluation prompts.")
+    print(f"Loaded {len(prompts)} held-out RL evaluation prompts (Batch size: {batch_size}).")
 
     all_rewards = []
     all_lengths = []
@@ -133,8 +121,10 @@ def evaluate_ppo(
                         "length": int(l_i),
                     })
 
-        if (i // batch_size) % 25 == 0:
-            print(f"Evaluated {min(i + batch_size, total_prompts)} / {total_prompts} prompts...")
+        # Regular visible progress updates every ~24-32 prompts
+        processed = min(i + len(b_prompts), total_prompts)
+        if processed % 24 == 0 or processed == total_prompts:
+            print(f"Evaluated {processed:03d} / {total_prompts} prompts...")
 
         del gen, sequences, attention_mask, response_ids, response_mask, pol_tok_logp, ref_tok_logp, rewards
         torch.cuda.empty_cache()
@@ -180,12 +170,14 @@ def main():
     ap.add_argument("--adapter", required=True)
     ap.add_argument("--name", default="standard")
     ap.add_argument("--output-dir")
+    ap.add_argument("--batch-size", type=int, default=8)
     args = ap.parse_args()
     evaluate_ppo(
         config_path=args.config,
         adapter_path=args.adapter,
         run_name=args.name,
         output_dir=args.output_dir,
+        batch_size=args.batch_size,
     )
 
 
