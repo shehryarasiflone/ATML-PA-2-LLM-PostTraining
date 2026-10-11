@@ -3,15 +3,22 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import logging
 import re
+import warnings
 from pathlib import Path
+
+# Silence 8-bit quantized matrix multiplication warnings
+warnings.filterwarnings("ignore", message=".*MatMul8bitLt.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes")
+logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
 
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from common.data import repo_path
-from common.models import resolve_dtype
+from common.models import clear_gpu, resolve_dtype
 
 PAIRWISE_RUBRIC = """You are comparing two candidate solutions to the same math problem.
 
@@ -40,7 +47,10 @@ class PairwiseAIJudge:
         self.cfg = cfg
         self.cache_path = repo_path(cache_path)
         if self.cache_path.exists():
-            self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            try:
+                self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                self.cache = {}
         else:
             self.cache = {}
 
@@ -80,19 +90,34 @@ class PairwiseAIJudge:
         swap = int(key[:8], 16) % 2 == 1
         aa, bb = (b, a) if swap else (a, b)
         text = PAIRWISE_RUBRIC.format(problem=problem, a=aa, b=bb)
-        ids = self.tokenizer.apply_chat_template(
+
+        enc = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": text}],
             return_tensors="pt",
             add_generation_prompt=True,
-        ).to(next(self.model.parameters()).device)
+        )
+
+        device = next(self.model.parameters()).device
+        if isinstance(enc, torch.Tensor):
+            input_ids = enc.to(device)
+            attention_mask = None
+        else:
+            input_ids = enc["input_ids"].to(device)
+            attention_mask = enc.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+
         out = self.model.generate(
-            ids,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=4,
             do_sample=False,
-            pad_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
-        decoded = self.tokenizer.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip().upper()
+
+        prompt_len = input_ids.shape[1]
+        decoded = self.tokenizer.decode(out[0, prompt_len:], skip_special_tokens=True).strip().upper()
         m = re.search(r"\b(A|B|TIE)\b", decoded)
         result = m.group(1) if m else "TIE"
         if swap:
@@ -117,3 +142,6 @@ class PairwiseAIJudge:
                 ties[i] += 1
                 ties[j] += 1
         return ((wins + 0.5 * ties) / max(k - 1, 1)).tolist()
+
+    def close(self):
+        clear_gpu(self.model)
