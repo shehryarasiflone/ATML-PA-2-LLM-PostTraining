@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import logging
 import re
+import warnings
 from pathlib import Path
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+# Silence 8-bit quantized matrix multiplication warnings
+warnings.filterwarnings("ignore", message=".*MatMul8bitLt.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes")
+logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
 
-from common.data import load_yaml, read_jsonl
-from common.models import resolve_dtype
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+from common.data import load_yaml, read_jsonl, repo_path
+from common.models import clear_gpu, resolve_dtype
 
 LABELS = {
     "SAFE_ANSWER",
@@ -98,24 +106,61 @@ def judge_one(tok, model, prompt, response, max_new_tokens=64):
         pad_token_id=tok.eos_token_id,
         eos_token_id=tok.eos_token_id,
     )
-    generated = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+    generated = tok.decode(out[0, ids.shape[1] :], skip_special_tokens=True)
     return parse_json(generated)
+
+
+def judge_policy_file(tok, model, in_file: Path, out_file: Path, max_tokens: int = 64):
+    rows = read_jsonl(in_file)
+    print(f"\nEvaluating {len(rows)} responses from {in_file.name}...")
+    judged_records = []
+
+    for idx, r in enumerate(rows, 1):
+        decision = judge_one(tok, model, r["prompt"], r["response"], max_new_tokens=max_tokens)
+        record = dict(r)
+        record["judge_label"] = decision["label"]
+        record["judge_confidence"] = decision["confidence"]
+        record["judge_rationale_tag"] = decision["rationale_tag"]
+        judged_records.append(record)
+
+        if idx % 50 == 0 or idx == len(rows):
+            print(f"Judged {idx:03d} / {len(rows):03d} responses...")
+
+    with out_file.open("w", encoding="utf-8") as f:
+        for r in judged_records:
+            f.write(json.dumps(r) + "\n")
+
+    print(f"Saved judged responses to: {out_file}")
+    return judged_records
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/feedback.yaml")
-    ap.add_argument("--input", help="Optional generated JSONL file to inspect")
+    ap.add_argument("--policy", choices=["sft", "dpo", "ppo", "grpo", "all"], default="all")
     args = ap.parse_args()
+
     cfg = load_yaml(args.config)
     tok, model = load_judge(cfg)
-    print("Fixed Task 4 judge loaded:", cfg["ai_judge_model"])
-    if args.input:
-        rows = read_jsonl(args.input)
-        print("Input rows:", len(rows))
-    raise NotImplementedError(
-        "TODO(student): apply judge_one to your frozen-policy response files, cache the labels, and implement the required Task 4 aggregation."
-    )
+    print(f"Loaded Task 4 AI Judge: {cfg['ai_judge_model']}")
+
+    outdir = repo_path(cfg["results_dir"]) / "task4_safety"
+    max_tokens = int(cfg.get("judge_max_new_tokens", 64))
+    policies = ["sft", "dpo", "ppo", "grpo"] if args.policy == "all" else [args.policy]
+
+    for pol in policies:
+        in_file = outdir / f"generated_{pol}.jsonl"
+        if not in_file.exists():
+            print(f"Skipping {pol}: {in_file} does not exist.")
+            continue
+        out_file = outdir / f"judged_{pol}.jsonl"
+        judge_policy_file(tok, model, in_file, out_file, max_tokens=max_tokens)
+
+    clear_gpu(model)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("\n--- AI Judging Complete ---")
 
 
 if __name__ == "__main__":
